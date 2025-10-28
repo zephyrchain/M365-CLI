@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# discovery_one_csv.sh
+# Consolidates tenant SKUs, SKU service plans, users (with usageLocation),
+# and each user's assigned SKUs/plans into one CSV: discovery_all.csv
+
+set -u  # no unbound variables
+OUTPUT="${OUTPUT:-discovery_all.csv}"
+
+# --------- helpers ----------
+urlencode() { # minimal URL encoder for UPNs
+  local s="$1" out="" i c
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    [[ "$c" =~ [a-zA-Z0-9.~_-] ]] && out+="$c" || printf -v out '%s%%%02X' "$out" "'$c"
+  done
+  echo "$out"
+}
+
+require_az() {
+  command -v az >/dev/null 2>&1 || { echo "Azure CLI 'az' not found"; return 1; }
+  az account show >/dev/null 2>&1 || { echo "Please run: az login"; return 1; }
+}
+
+# safe echo of a CSV line; values here should not contain commas
+emit_csv() {
+  # Always emit 12 columns in order
+  local section="${1:-}" part="${2:-}" skuid="${3:-}" enabled="${4:-}" used="${5:-}"
+  local planName="${6:-}" planId="${7:-}" upn="${8:-}" ul="${9:-}"
+  local aPart="${10:-}" aId="${11:-}" pStatus="${12:-}"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$section" "$part" "$skuid" "$enabled" "$used" \
+    "$planName" "$planId" "$upn" "$ul" "$aPart" "$aId" "$pStatus"
+}
+
+# --------- start ---------
+require_az || { echo "Cannot continue."; exit 0; }  # don't kill shell pane on failure
+
+echo "Writing: $OUTPUT"
+echo "section,skuPartNumber,skuId,enabledUnits,consumedUnits,servicePlanName,servicePlanId,userPrincipalName,usageLocation,assignedSkuPartNumber,assignedSkuId,planProvisioningStatus" > "$OUTPUT"
+
+# Cache user -> usageLocation for later license rows
+declare -A UPN_TO_UL
+
+# 1) Tenant SKUs and counts (and SKU plans)
+echo "Collecting tenant SKUs ..."
+# TSV: skuPartNumber \t skuId \t enabled \t used
+while IFS=$'\t' read -r PART ID ENABLED USED; do
+  [[ -z "$PART" && -z "$ID" ]] && continue
+  emit_csv "TENANT_SKU" "$PART" "$ID" "$ENABLED" "$USED" "" "" "" "" "" "" "" >> "$OUTPUT"
+
+  # Plans for this SKU (servicePlanName \t servicePlanId)
+  while IFS=$'\t' read -r PNAME PID; do
+    [[ -z "$PNAME" && -z "$PID" ]] && continue
+    emit_csv "SKU_PLAN" "$PART" "$ID" "$ENABLED" "$USED" "$PNAME" "$PID" "" "" "" "" "" >> "$OUTPUT"
+  done < <(
+    az rest --method GET --url "https://graph.microsoft.com/v1.0/subscribedSkus" \
+      --only-show-errors \
+      --query "value[?skuId=='$ID'].servicePlans[].{n:servicePlanName,i:servicePlanId}" -o tsv 2>/dev/null || true
+  )
+done < <(
+  az rest --method GET --url "https://graph.microsoft.com/v1.0/subscribedSkus" \
+    --only-show-errors \
+    --query "value[].{part:skuPartNumber,id:skuId,enabled:prepaidUnits.enabled,used:consumedUnits}" -o tsv 2>/dev/null || true
+)
+
+# 2) All users (paged) with usageLocation
+echo "Collecting users (paged) ..."
+URL="https://graph.microsoft.com/v1.0/users?\$select=userPrincipalName,usageLocation&\$top=999"
+while : ; do
+  # Page rows: userPrincipalName \t usageLocation
+  PAGE_TSV=$(az rest --method GET --url "$URL" --only-show-errors \
+             --query "value[].{u:userPrincipalName,l:usageLocation}" -o tsv 2>/dev/null) || PAGE_TSV=""
+  if [[ -n "$PAGE_TSV" ]]; then
+    while IFS=$'\t' read -r UPN UL; do
+      [[ -z "$UPN" ]] && continue
+      UPN_TO_UL["$UPN"]="$UL"
+      emit_csv "USER" "" "" "" "" "" "" "$UPN" "$UL" "" "" "" >> "$OUTPUT"
+    done <<< "$PAGE_TSV"
+  fi
+
+  NEXT=$(az rest --method GET --url "$URL" --only-show-errors \
+          --query '@odata.nextLink' -o tsv 2>/dev/null | tr -d '\r')
+  # If the query of nextLink doesn't work on subsequent calls, explicitly fetch it once
+  if [[ -z "$NEXT" ]]; then
+    NEXT=$(az rest --method GET --url "$URL" --only-show-errors -o json 2>/dev/null \
+            | python3 - <<'PY'
+import sys, json
+try:
+    data=json.load(sys.stdin); print(data.get("@odata.nextLink",""))
+except: print("")
+PY
+         )
+  fi
+  [[ -z "$NEXT" ]] && break
+  URL="$NEXT"
+done
+
+# 3) Per-user license details (each assigned SKU and plan)
+echo "Collecting per-user license details ..."
+for UPN in "${!UPN_TO_UL[@]}"; do
+  ENC_UPN="$(urlencode "$UPN")"
+  UL="${UPN_TO_UL[$UPN]}"
+  # One call per user; flatten JSON to CSV via small Python block
+  az rest --method GET --url "https://graph.microsoft.com/v1.0/users/$ENC_UPN/licenseDetails" \
+    --only-show-errors -o json 2>/dev/null \
+  | python3 - "$UPN" "$UL" "$OUTPUT" <<'PY'
+import sys, json, csv
+upn, ul, out = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data=json.load(sys.stdin)
+except:
+    sys.exit(0)
+rows=[]
+for lic in data.get("value", []):
+    skuPart = lic.get("skuPartNumber","")
+    skuId   = lic.get("skuId","")
+    for sp in lic.get("servicePlans", []):
+        rows.append(["USER_LICENSE_PLAN","", "", "", "", sp.get("servicePlanName",""), sp.get("servicePlanId",""),
+                     upn, ul, skuPart, skuId, sp.get("provisioningStatus","")])
+# Append to existing CSV
+with open(out, "a", newline="") as f:
+    w=csv.writer(f)
+    w.writerows(rows)
+PY
+done
+
+echo "Done."
+echo "File written: $OUTPUT"
+``
