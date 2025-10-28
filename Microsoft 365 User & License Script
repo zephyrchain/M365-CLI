@@ -1,0 +1,66 @@
+set -u
+
+########################################
+# CONFIG
+########################################
+LICENSE_SKU_ID=""                # Leave blank to select interactively
+DEFAULT_USAGE_LOCATION="US"      # ISO country code for license assignment
+declare -a USERS=(
+  "Don Joe djoe djoe@yourdomain.us Password123 US"
+  # Add more: "First Last Alias UPN Password [UsageLocation]"
+)
+########################################
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+require_cmd() { command -v "$1" >/dev/null || die "'$1' not installed."; }
+urlencode() { local s="$1"; local out=""; for ((i=0;i<${#s};i++)); do c="${s:$i:1}"; [[ $c =~ [a-zA-Z0-9.~_-] ]] && out+="$c" || printf -v out '%s%%%02X' "$out" "'$c"; done; echo "$out"; }
+
+check_prereqs() { require_cmd az; require_cmd curl; require_cmd jq; }
+get_token() { access_token=$(az account get-access-token --scope https://graph.microsoft.com/.default --query accessToken -o tsv) || die "Token error"; }
+fetch_skus() { curl -s "https://graph.microsoft.com/v1.0/subscribedSkus" -H "Authorization: Bearer $access_token"; }
+pick_sku() {
+  local skus=$(fetch_skus)
+  echo "$skus" | jq -r '.value | to_entries[] | "\(.key): \(.value.skuPartNumber) (\(.value.skuId))"'
+  read -p "Enter index or skuId: " sel
+  [[ $sel =~ ^[0-9]+$ ]] && LICENSE_SKU_ID=$(echo "$skus" | jq -r ".value[$sel].skuId") || LICENSE_SKU_ID="$sel"
+}
+user_exists() { curl -s "https://graph.microsoft.com/v1.0/users/$(urlencode "$1")" -H "Authorization: Bearer $access_token" | jq -e '.id' >/dev/null; }
+set_usage_location() {
+  local upn_enc=$(urlencode "$1")
+  curl -s -X PATCH "https://graph.microsoft.com/v1.0/users/$upn_enc" \
+    -H "Authorization: Bearer $access_token" -H "Content-Type: application/json" \
+    -d "$(jq -n --arg ul "$2" '{usageLocation:$ul}')"
+}
+create_users() {
+  local -n arr=$1
+  for u in "${arr[@]}"; do
+    read fn ln alias upn pw ul <<< "$u"
+    user_exists "$upn" && { echo "Exists: $upn"; continue; }
+    curl -s -X POST "https://graph.microsoft.com/v1.0/users" \
+      -H "Authorization: Bearer $access_token" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg fn "$fn" --arg ln "$ln" --arg alias "$alias" --arg upn "$upn" --arg pw "$pw" \
+        '{accountEnabled:true,displayName:($fn+" "+$ln),mailNickname:$alias,userPrincipalName:$upn,passwordProfile:{forceChangePasswordNextSignIn:false,password:$pw}}')"
+  done
+}
+assign_licenses() {
+  local -n arr=$1
+  for u in "${arr[@]}"; do
+    read fn ln alias upn pw ul <<< "$u"
+    user_exists "$upn" || { echo "Not found: $upn"; continue; }
+    set_usage_location "$upn" "${ul:-$DEFAULT_USAGE_LOCATION}"
+    curl -s -X POST "https://graph.microsoft.com/v1.0/users/$(urlencode "$upn")/assignLicense" \
+      -H "Authorization: Bearer $access_token" -H "Content-Type: application/json" \
+      -d "$(jq -n --arg sku "$LICENSE_SKU_ID" '{addLicenses:[{skuId:$sku}],removeLicenses:[]}')"
+  done
+}
+
+main() {
+  check_prereqs
+  get_token
+  [[ -z "$LICENSE_SKU_ID" ]] && pick_sku
+  create_users USERS
+  assign_licenses USERS
+  echo "Done."
+}
+
+main "$@"
