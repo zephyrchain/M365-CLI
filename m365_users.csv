@@ -1,0 +1,7 @@
+Action,FirstName,LastName,Alias,UserPrincipalName,Password,UsageLocation,AddSkus,RemoveSkus,DisablePlans,SkipLicense
+create,John,Doe,jdoe,jdoe@contoso.com,P@ssword123,US,M365_BUSINESS_PREMIUM,,EXCHANGE_S_FOUNDATION,false
+create,Jane,Smith,jsmith,jsmith@contoso.com,P@ssword456,GB,ENTERPRISEPREMIUM,,,"false"
+assign,,,,alex@contoso.com,,,EMS,,ADALLOM_S_STANDALONE,false
+assign,,,,multi@contoso.com,,,M365_BUSINESS_PREMIUM,EMS,"M365_BUSINESS_PREMIUM:EXCHANGE_S_FOUNDATION,TEAMS1;EMS:ADALLOM_S_STANDALONE",false
+remove,,,,legacy@contoso.com,,,,M365_BUSINESS_STANDARD,,false
+delete,,,,olduser@contoso.com,,,,,,true
