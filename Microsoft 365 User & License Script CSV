@@ -1,0 +1,244 @@
+set -u
+
+# =========================
+# CONFIG DEFAULTS
+# =========================
+CSV_FILE="m365_users.csv"
+DEFAULT_USAGE_LOCATION="US"     # two-letter ISO code
+GLOBAL_SKIP_LICENSE="false"     # overridden by --skip-license
+# =========================
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+require(){ command -v "$1" >/dev/null 2>&1 || die "'$1' not found."; }
+is_guid(){ [[ "$1" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]]; }
+urlencode(){ local s="${1}"; local out="" i c; for((i=0;i<${#s};i++));do c="${s:i:1}"; [[ "$c" =~ [a-zA-Z0-9.~_-] ]] && out+="$c" || printf -v out '%s%%%02X' "$out" "'$c"; done; echo "$out"; }
+trimq(){ local v="$1"; v="${v%$'\r'}"; v="${v%\"}"; v="${v#\"}"; echo "$v"; }
+
+# SKU maps
+declare -A SKU_PART_TO_ID
+declare -A SKU_ID_TO_PART
+
+# -------------------------
+# Graph helpers (az rest)
+# -------------------------
+list_skus_raw(){
+  az rest --method GET --url "https://graph.microsoft.com/v1.0/subscribedSkus" --only-show-errors \
+    --query "value[].{part:skuPartNumber,id:skuId,enabled:prepaidUnits.enabled,used:consumedUnits}" -o tsv
+}
+build_sku_maps(){
+  local line part id
+  while IFS=$'\t' read -r part id _ _; do
+    [[ -n "$part" && -n "$id" ]] || continue
+    SKU_PART_TO_ID["$part"]="$id"
+    SKU_ID_TO_PART["$id"]="$part"
+  done < <(list_skus_raw)
+}
+resolve_sku(){
+  local val="$1"
+  if is_guid "$val"; then echo "$val"; return 0; fi
+  [[ -n "${SKU_PART_TO_ID[$val]:-}" ]] && { echo "${SKU_PART_TO_ID[$val]}"; return 0; }
+  die "Unknown SKU '$val' (not a guid and not a skuPartNumber in tenant)."
+}
+resolve_sku_list(){
+  local csv="$1" out=() item
+  IFS=',' read -r -a arr <<< "$csv"
+  for item in "${arr[@]:-}"; do
+    item="$(echo "$item" | xargs)"
+    [[ -z "$item" ]] && continue
+    out+=( "$(resolve_sku "$item")" )
+  done
+  printf "%s" "${out[*]}"
+}
+
+user_exists(){
+  local upn="$1" upn_enc; upn_enc="$(urlencode "$upn")"
+  az rest --method GET --url "https://graph.microsoft.com/v1.0/users/$upn_enc" --only-show-errors \
+    --query "id" -o tsv 2>/dev/null | grep -q .
+}
+create_user(){
+  local fn="$1" ln="$2" alias="$3" upn="$4" pw="$5"
+  user_exists "$upn" && { echo "Exists: $upn"; return 0; }
+  local body
+  body=$(cat <<JSON
+{"accountEnabled":true,"displayName":"$fn $ln","mailNickname":"$alias","userPrincipalName":"$upn","passwordProfile":{"forceChangePasswordNextSignIn":false,"password":"$pw"}}
+JSON
+)
+  az rest --method POST --url "https://graph.microsoft.com/v1.0/users" --only-show-errors \
+    --headers "Content-Type=application/json" --body "$body" >/dev/null && echo "Created: $upn" || echo "Create failed: $upn"
+}
+delete_user(){
+  local upn="$1" enc; enc="$(urlencode "$upn")"
+  user_exists "$upn" || { echo "Not found: $upn"; return 0; }
+  az rest --method DELETE --url "https://graph.microsoft.com/v1.0/users/$enc" --only-show-errors >/dev/null \
+    && echo "Deleted: $upn" || echo "Delete failed: $upn"
+}
+
+get_usage_location(){
+  local upn="$1" enc; enc="$(urlencode "$upn")"
+  az rest --method GET --url "https://graph.microsoft.com/v1.0/users/$enc?\$select=usageLocation" --only-show-errors \
+    --query "usageLocation" -o tsv 2>/dev/null
+}
+set_usage_location(){
+  local upn="$1" ul="$2" enc; enc="$(urlencode "$upn")"
+  ul="$(echo "$ul" | tr '[:lower:]' '[:upper:]' | cut -c1-2)"
+  [[ -z "$ul" ]] && die "Empty usageLocation for $upn"
+  az rest --method PATCH --url "https://graph.microsoft.com/v1.0/users/$enc" --only-show-errors \
+    --headers "Content-Type=application/json" --body "{\"usageLocation\":\"$ul\"}" >/dev/null \
+    && echo "usageLocation set: $upn=$ul" || echo "usageLocation set failed: $upn"
+}
+ensure_usage_location(){
+  local upn="$1" desired="$2"
+  local cur; cur="$(get_usage_location "$upn")"
+  if [[ -z "$cur" || "${#cur}" -ne 2 ]]; then set_usage_location "$upn" "$desired"; fi
+}
+
+json_array_guids(){ # space-separated -> ["a","b"]
+  local items=($1) out="[" i
+  for i in "${!items[@]}"; do
+    [[ $i -gt 0 ]] && out+=","
+    out+="\"${items[$i]}\""
+  done
+  out+="]"
+  printf "%s" "$out"
+}
+json_add_licenses(){ # space-separated -> [{"skuId":"a"},{"skuId":"b"}]
+  local items=($1) out="[" i
+  for i in "${!items[@]}"; do
+    [[ $i -gt 0 ]] && out+=","
+    out+="{\"skuId\":\"${items[$i]}\"}"
+  done
+  out+="]"
+  printf "%s" "$out"
+}
+assign_remove_licenses(){
+  local upn="$1" add_csv="$2" remove_csv="$3"
+  local add_ids remove_ids
+  add_ids="$(resolve_sku_list "$add_csv")"
+  remove_ids="$(resolve_sku_list "$remove_csv")"
+
+  local add_json remove_json
+  add_json="$(json_add_licenses "$add_ids")"
+  remove_json="$(json_array_guids "$remove_ids")"
+
+  local enc; enc="$(urlencode "$upn")"
+  local body
+  body="{\"addLicenses\":$add_json,\"removeLicenses\":$remove_json}"
+
+  az rest --method POST --url "https://graph.microsoft.com/v1.0/users/$enc/assignLicense" --only-show-errors \
+    --headers "Content-Type=application/json" --body "$body" >/dev/null \
+    && echo "Licenses updated: $upn" || echo "License update failed: $upn"
+}
+
+list_skus(){
+  build_sku_maps
+  printf "%-30s %-38s %-7s %-7s\n" "skuPartNumber" "skuId" "enabled" "used"
+  list_skus_raw | awk -F'\t' '{printf "%-30s %-38s %-7s %-7s\n",$1,$2,$3,$4}'
+}
+
+init_csv(){
+  local file="$1"
+  cat > "$file" <<'CSV'
+Action,FirstName,LastName,Alias,UserPrincipalName,Password,UsageLocation,AddSkus,RemoveSkus,SkipLicense
+create,First,Last,alias,user@yourtenant.onmicrosoft.com,StrongP@ss!,US,M365_BUSINESS_PREMIUM,,
+assign,,,,existing@yourtenant.com,,,EMS,,
+remove,,,,existing2@yourtenant.com,,,,false
+delete,,,,olduser@yourtenant.com,,,,true
+CSV
+  echo "Template written: $file"
+}
+
+process_csv(){
+  local file="$1"
+  [[ -f "$file" ]] || die "CSV not found: $file"
+  build_sku_maps
+
+  tail -n +2 "$file" | while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    line="${line%$'\r'}"
+    IFS=, read -r Action FirstName LastName Alias UserPrincipalName Password UsageLocation AddSkus RemoveSkus SkipLicense <<< "$line"
+
+    Action="$(trimq "$Action")"; FirstName="$(trimq "$FirstName")"; LastName="$(trimq "$LastName")"
+    Alias="$(trimq "$Alias")"; UserPrincipalName="$(trimq "$UserPrincipalName")"; Password="$(trimq "$Password")"
+    UsageLocation="$(trimq "$UsageLocation")"; AddSkus="$(trimq "$AddSkus")"; RemoveSkus="$(trimq "$RemoveSkus")"
+    SkipLicense="$(trimq "${SkipLicense:-}")"
+
+    case "${Action,,}" in
+      create)
+        if [[ -z "$FirstName" || -z "$LastName" || -z "$Alias" || -z "$UserPrincipalName" || -z "$Password" ]]; then
+          echo "Row missing fields for create: $UserPrincipalName"; continue; fi
+        create_user "$FirstName" "$LastName" "$Alias" "$UserPrincipalName" "$Password"
+        if [[ "${GLOBAL_SKIP_LICENSE,,}" != "true" && "${SkipLicense,,}" != "true" && -n "$AddSkus" ]]; then
+          ensure_usage_location "$UserPrincipalName" "${UsageLocation:-$DEFAULT_USAGE_LOCATION}"
+          assign_remove_licenses "$UserPrincipalName" "$AddSkus" ""
+        fi
+        ;;
+      delete)
+        [[ -z "$UserPrincipalName" ]] && { echo "Row missing UPN for delete"; continue; }
+        delete_user "$UserPrincipalName"
+        ;;
+      assign)
+        [[ -z "$UserPrincipalName" ]] && { echo "Row missing UPN for assign"; continue; }
+        if [[ "${GLOBAL_SKIP_LICENSE,,}" == "true" || "${SkipLicense,,}" == "true" ]]; then
+          echo "Skipped license (flag): $UserPrincipalName"
+        else
+          ensure_usage_location "$UserPrincipalName" "${UsageLocation:-$DEFAULT_USAGE_LOCATION}"
+          assign_remove_licenses "$UserPrincipalName" "$AddSkus" ""
+        fi
+        ;;
+      remove)
+        [[ -z "$UserPrincipalName" ]] && { echo "Row missing UPN for remove"; continue; }
+        if [[ "${GLOBAL_SKIP_LICENSE,,}" == "true" || "${SkipLicense,,}" == "true" ]]; then
+          echo "Skipped license (flag): $UserPrincipalName"
+        else
+          assign_remove_licenses "$UserPrincipalName" "" "$RemoveSkus"
+        fi
+        ;;
+      *) echo "Unknown Action '$Action' for $UserPrincipalName" ;;
+    esac
+  done
+}
+
+usage(){
+  cat <<EOF
+Usage:
+  $0 --init-csv [--csv FILE]
+  $0 --list-skus
+  $0 --csv FILE [--skip-license] process
+  $0 --csv FILE [--skip-license] create|delete|assign|remove
+
+CSV columns: Action,FirstName,LastName,Alias,UserPrincipalName,Password,UsageLocation,AddSkus,RemoveSkus,SkipLicense
+Skus may be skuId GUIDs or skuPartNumber (resolved via /subscribedSkus).
+EOF
+}
+
+main(){
+  require az
+  local cmd="" csv="$CSV_FILE"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --csv) csv="$2"; shift 2 ;;
+      --skip-license) GLOBAL_SKIP_LICENSE="true"; shift ;;
+      --init-csv) cmd="init"; shift ;;
+      --list-skus) cmd="list"; shift ;;
+      process|create|delete|assign|remove) cmd="$1"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) echo "Unknown arg: $1"; usage; exit 1 ;;
+    esac
+  done
+
+  case "$cmd" in
+    init) init_csv "$csv" ;;
+    list) list_skus ;;
+    ""|process)
+      process_csv "$csv"
+      ;;
+    create|delete|assign|remove)
+      # Filter rows by Action and process
+      awk -v a="$cmd" 'BEGIN{FS=","} NR==1 || tolower($1)==a' "$csv" > /tmp/m365_cmd.csv
+      process_csv "/tmp/m365_cmd.csv"
+      ;;
+  esac
+}
+
+main "$@"
+
